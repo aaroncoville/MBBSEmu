@@ -73,43 +73,55 @@ namespace MBBSEmu.Session
         /// </summary>
         private void SendWorker()
         {
-            while (SessionState != EnumSessionState.LoggedOff && _socket.Connected)
+            try
             {
-                bool tookData;
-                byte[] dataToSend;
-                try
+                while (SessionState != EnumSessionState.LoggedOff && _socket.Connected)
                 {
-                    tookData = DataToClient.TryTake(out dataToSend, 500, _cancellationTokenSource.Token);
-                } catch (Exception) // either ObjectDisposedException | OperationCanceledException
-                {
-                    return;
-                }
-
-                if (SessionState == EnumSessionState.LoggingOffProcessing)
-                {
-                    CloseSocket("User-initiated log off");
-                    return;
-                }
-
-                //If EchoEmpty is on, we actually sent data, AND there's no longer data to send, trigger
-                if (EchoEmptyInvokeEnabled && tookData && DataToClient.Count == 0)
-                    EchoEmptyInvoke = true;
-
-                PreSend();
-
-                if (!tookData)
-                {
-                    if (!Heartbeat()) {
-                        break;
+                    bool tookData;
+                    byte[] dataToSend;
+                    try
+                    {
+                        tookData = DataToClient.TryTake(out dataToSend, 500, _cancellationTokenSource.Token);
                     }
-                    continue;
+                    catch (Exception) // either ObjectDisposedException | OperationCanceledException
+                    {
+                        return;
+                    }
+
+                    if (SessionState == EnumSessionState.LoggingOffProcessing)
+                    {
+                        CloseSocket("User-initiated log off");
+                        return;
+                    }
+
+                    //If EchoEmpty is on, we actually sent data, AND there's no longer data to send, trigger
+                    if (EchoEmptyInvokeEnabled && tookData && DataToClient.Count == 0)
+                        EchoEmptyInvoke = true;
+
+                    PreSend();
+
+                    if (!tookData)
+                    {
+                        if (!Heartbeat())
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    Send(dataToSend);
                 }
 
-                Send(dataToSend);
+                //Cleanup if the connection was dropped
+                CloseSocket("sending thread natural completion");
             }
-
-            //Cleanup if the connection was dropped
-            CloseSocket("sending thread natural completion");
+            catch (Exception ex)
+            {
+                _logger.Error(ex, "Socket Send Exception");
+                CloseSocket("Socket Send Exception");
+            }
+            
+            
         }
 
         /// <summary>
@@ -126,26 +138,38 @@ namespace MBBSEmu.Session
         /// </summary>
         private void OnReceiveData(IAsyncResult asyncResult)
         {
-            int bytesReceived;
-            SocketError socketError;
+            try
+            {
+                int bytesReceived;
+                SocketError socketError;
 
-            try {
-                bytesReceived = _socket.EndReceive(asyncResult, out socketError);
-                if (bytesReceived == 0) {
-                    CloseSocket("Client disconnected");
-                    _mbbsHost.TriggerProcessing();
+                try
+                {
+                    bytesReceived = _socket.EndReceive(asyncResult, out socketError);
+                    if (bytesReceived == 0)
+                    {
+                        CloseSocket("Client disconnected");
+                        _mbbsHost.TriggerProcessing();
+                        return;
+                    }
+                }
+                catch (ObjectDisposedException)
+                {
+                    SessionState = EnumSessionState.LoggedOff;
                     return;
                 }
-            } catch (ObjectDisposedException) {
-                SessionState = EnumSessionState.LoggedOff;
-                return;
+
+                ValidateSocketState(socketError);
+                ProcessIncomingClientData(bytesReceived);
+                ListenForData();
+
+                _mbbsHost.TriggerProcessing();
             }
-
-            ValidateSocketState(socketError);
-            ProcessIncomingClientData(bytesReceived);
-            ListenForData();
-
-            _mbbsHost.TriggerProcessing();
+            catch(Exception ex)
+            {
+                _logger.Error(ex, "Socket Receive Error");
+                CloseSocket("Socket Receive Error");
+            }
         }
 
         /// <summary>
@@ -189,15 +213,23 @@ namespace MBBSEmu.Session
         }
 
         protected void CloseSocket(string reason) {
-            if (SessionState != EnumSessionState.LoggedOff) {
-                _logger.Warn($"Session {SessionId} (Channel: {Channel}) {reason}");
+            try
+            {
+                if (SessionState != EnumSessionState.LoggedOff)
+                {
+                    _logger.Warn($"Session {SessionId} (Channel: {Channel}) {reason}");
+                }
+
+                _socket.Close();
+                SessionState = EnumSessionState.LoggedOff;
+
+                // send signal to the send thread to abort
+                _cancellationTokenSource.Cancel();
             }
-
-            _socket.Close();
-            SessionState = EnumSessionState.LoggedOff;
-
-            // send signal to the send thread to abort
-            _cancellationTokenSource.Cancel();
+            catch(Exception ex)
+            {
+                _logger.Error(ex, "Error Closing Socket");
+            }
         }
     }
 }
